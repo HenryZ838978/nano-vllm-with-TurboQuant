@@ -97,45 +97,48 @@ class TurboQuantEngine:
         scale: float,
     ) -> torch.Tensor:
         """
-        Compute full attention output using TQ asymmetric estimator on keys
-        and standard weighted sum on values.
+        GQA-aware asymmetric attention — avoids repeat_interleave expansion.
 
         Args:
-            queries:     (batch, num_q_heads, 1, head_dim) — decode queries
-            compressed_k: dict from compress_keys, reshaped to (batch, num_kv_heads, seq_len, head_dim)
-            values:      (batch, num_kv_heads, seq_len, head_dim) — FP16 values from cache
-            scale:       attention softmax scale (1/sqrt(head_dim))
+            queries:     (B, Hq, 1, D) — decode queries
+            compressed_k: dict with shapes (B, Hkv, S, D) / (B, Hkv, S)
+            values:      (B, Hkv, S, D)
+            scale:       1/sqrt(D)
 
         Returns:
-            output: (batch, num_q_heads, 1, head_dim)
+            (B, Hq, 1, D)
         """
-        k_mse = compressed_k["k_mse"].float()
-        signs = compressed_k["qjl_signs"].float()
-        r_norm = compressed_k["residual_norm"].float()
-        q = queries.float()
+        k_mse = compressed_k["k_mse"]
+        signs = compressed_k["qjl_signs"]
+        r_norm = compressed_k["residual_norm"]
+        q = queries
 
         B, Hq, _, D = q.shape
         Hkv = k_mse.shape[1]
-        num_groups = Hq // Hkv
+        G = Hq // Hkv
+        S = k_mse.shape[2]
 
-        if num_groups > 1:
-            k_mse = k_mse.repeat_interleave(num_groups, dim=1)
-            signs = signs.repeat_interleave(num_groups, dim=1)
-            r_norm = r_norm.repeat_interleave(num_groups, dim=1)
-            values = values.repeat_interleave(num_groups, dim=1)
+        # Reshape Q to group dim: (B, Hkv, G, 1, D)
+        q = q.reshape(B, Hkv, G, 1, D)
 
-        # Term 1: Q @ K_mse^T
-        term1 = torch.matmul(q, k_mse.transpose(-2, -1))
+        # K/V stay at (B, Hkv, S, D) → add dim for broadcast: (B, Hkv, 1, S, D)
+        k_mse_5 = k_mse.unsqueeze(2)          # (B, Hkv, 1, S, D)
+        signs_5 = signs.unsqueeze(2).float()   # (B, Hkv, 1, S, D)
+        vals_5 = values.unsqueeze(2)           # (B, Hkv, 1, S, D)
+
+        # Term 1: Q @ K_mse^T  → (B, Hkv, G, 1, S)
+        term1 = torch.matmul(q.float(), k_mse_5.float().transpose(-2, -1))
 
         # Term 2: QJL correction
-        q_proj = torch.matmul(q, self.S.T)
-        qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        m = self.head_dim
-        correction = math.sqrt(math.pi / 2) / m
-        term2 = correction * qjl_ip * r_norm.unsqueeze(-2)
+        q_proj = torch.matmul(q.float(), self.S.T)   # (B, Hkv, G, 1, D)
+        qjl_ip = torch.matmul(q_proj, signs_5.transpose(-2, -1))  # (B, Hkv, G, 1, S)
+        correction = math.sqrt(math.pi / 2) / D
+        r_5 = r_norm.float().unsqueeze(2).unsqueeze(-2)  # (B, Hkv, 1, 1, S)
+        term2 = correction * qjl_ip * r_5
 
         scores = (term1 + term2) * scale
+        attn_w = torch.softmax(scores, dim=-1)         # (B, Hkv, G, 1, S)
 
-        attn_weights = torch.softmax(scores, dim=-1)
-        output = torch.matmul(attn_weights, values.float())
-        return output.to(queries.dtype)
+        out = torch.matmul(attn_w, vals_5.float())     # (B, Hkv, G, 1, D)
+        out = out.reshape(B, Hq, 1, D)
+        return out.to(queries.dtype)

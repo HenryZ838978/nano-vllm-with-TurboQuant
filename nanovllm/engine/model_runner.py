@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -32,7 +33,8 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        nccl_port = int(os.environ.get("NCCL_PORT", "2333"))
+        dist.init_process_group("nccl", f"tcp://localhost:{nccl_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -125,6 +127,10 @@ class ModelRunner:
         if config.kv_quant_bits is not None:
             from nanovllm.turboquant import TurboQuantEngine
             tq_engine = TurboQuantEngine(head_dim, config.kv_quant_bits, device="cuda")
+            nblk, bsz = config.num_kvcache_blocks, self.block_size
+            self.tq_k_mse = torch.zeros(hf_config.num_hidden_layers, nblk, bsz, num_kv_heads, head_dim, dtype=torch.float16)
+            self.tq_k_signs = torch.zeros(hf_config.num_hidden_layers, nblk, bsz, num_kv_heads, head_dim, dtype=torch.int8)
+            self.tq_k_rnorm = torch.zeros(hf_config.num_hidden_layers, nblk, bsz, num_kv_heads, dtype=torch.float16)
 
         layer_id = 0
         for module in self.model.modules():
@@ -133,6 +139,9 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 if tq_engine is not None:
                     module.tq_engine = tq_engine
+                    module.k_mse_cache = self.tq_k_mse[layer_id]
+                    module.k_signs_cache = self.tq_k_signs[layer_id]
+                    module.k_rnorm_cache = self.tq_k_rnorm[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
