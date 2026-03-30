@@ -6,10 +6,19 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+def get_model_class(hf_config):
+    arch = getattr(hf_config, "architectures", [""])[0]
+    if "MiniCPM" in arch:
+        from nanovllm.models.minicpm import MiniCPMForCausalLM
+        return MiniCPMForCausalLM
+    else:
+        from nanovllm.models.qwen3 import Qwen3ForCausalLM
+        return Qwen3ForCausalLM
 
 
 class ModelRunner:
@@ -28,7 +37,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = get_model_class(hf_config)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -110,11 +120,19 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        tq_engine = None
+        if config.kv_quant_bits is not None:
+            from nanovllm.turboquant import TurboQuantEngine
+            tq_engine = TurboQuantEngine(head_dim, config.kv_quant_bits, device="cuda")
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                if tq_engine is not None:
+                    module.tq_engine = tq_engine
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

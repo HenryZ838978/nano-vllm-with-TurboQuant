@@ -40,6 +40,34 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def gather_from_paged_cache(cache: torch.Tensor, block_table: torch.Tensor,
+                            context_lens: torch.Tensor, block_size: int) -> torch.Tensor:
+    """
+    Gather contiguous KV sequences from paged block cache.
+
+    Args:
+        cache:        (num_blocks, block_size, num_kv_heads, head_dim)
+        block_table:  (batch, max_num_blocks) — physical block ids per sequence
+        context_lens: (batch,) — actual token count per sequence
+        block_size:   tokens per block
+
+    Returns:
+        (batch, max_seq_len, num_kv_heads, head_dim) padded tensor
+    """
+    B = block_table.shape[0]
+    Hkv, D = cache.shape[2], cache.shape[3]
+    max_seq = context_lens.max().item()
+
+    out = torch.zeros(B, max_seq, Hkv, D, dtype=cache.dtype, device=cache.device)
+    for b in range(B):
+        L = context_lens[b].item()
+        nblocks = (L + block_size - 1) // block_size
+        block_ids = block_table[b, :nblocks]
+        gathered = cache[block_ids].reshape(-1, Hkv, D)[:L]
+        out[b, :L] = gathered
+    return out
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -55,6 +83,7 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.tq_engine = None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -69,7 +98,37 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            if self.tq_engine is not None:
+                o = self._tq_decode(q, context)
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True)
         return o
+
+    def _tq_decode(self, q: torch.Tensor, context) -> torch.Tensor:
+        """
+        Decode attention using TurboQuant asymmetric estimator.
+        Gathers K/V from paged cache, compresses K, computes attention.
+        """
+        block_size = self.k_cache.shape[1]
+        keys = gather_from_paged_cache(
+            self.k_cache, context.block_tables, context.context_lens, block_size)
+        vals = gather_from_paged_cache(
+            self.v_cache, context.block_tables, context.context_lens, block_size)
+
+        B, S, Hkv, D = keys.shape
+        keys_flat = keys.reshape(B * S * Hkv, D)
+        compressed_k = self.tq_engine.compress_keys(keys_flat)
+
+        compressed_k = {
+            "k_mse": compressed_k["k_mse"].reshape(B, S, Hkv, D).transpose(1, 2),
+            "qjl_signs": compressed_k["qjl_signs"].reshape(B, S, Hkv, D).transpose(1, 2),
+            "residual_norm": compressed_k["residual_norm"].reshape(B, S, Hkv).transpose(1, 2),
+        }
+
+        q_4d = q.unsqueeze(1).reshape(B, self.num_heads, 1, D)
+        vals_4d = vals.transpose(1, 2)  # (B, Hkv, S, D)
+
+        output = self.tq_engine.asymmetric_attention(q_4d, compressed_k, vals_4d, self.scale)
+        return output.reshape(B, 1, self.num_heads, D)
