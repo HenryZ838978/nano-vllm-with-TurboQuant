@@ -1,3 +1,5 @@
+> ✅ **Status: Done — archived on 2026-08-27.** This integration is feature-complete and no longer maintained.
+
 # nano-vLLM + TurboQuant
 
 Integrating TurboQuant KV cache compression into [nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm), a lightweight LLM inference engine.
